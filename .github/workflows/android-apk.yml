@@ -1,0 +1,45 @@
+
+name: Steel Horizon Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    container:
+      image: barichello/godot-ci:4.3.0
+
+    steps:
+      - name: Download repository
+        uses: actions/checkout@v4
+
+      - name: Extract Godot project
+        run: |
+          apt-get update
+          apt-get install -y unzip
+          unzip -q SteelHorizon-Godot-Prototype.zip -d unpacked
+          test -f unpacked/SteelHorizon/project.godot
+
+      - name: Import project
+        run: |
+          godot --headless --path unpacked/SteelHorizon --editor --quit
+
+      - name: Build Android APK
+        run: |
+          mkdir -p unpacked/SteelHorizon/build
+          godot --headless --path unpacked/SteelHorizon --export-debug "Android" unpacked/SteelHorizon/build/SteelHorizon-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SteelHorizon-Android-APK
+          path: unpacked/SteelHorizon/build/SteelHorizon-debug.apk
+          if-no-files-found: error
+          retention-days: 14
