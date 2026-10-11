@@ -1,114 +1,250 @@
+name: Build SteelHorizon Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "**"
+      - ".github/workflows/android-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    name: Build Android APK
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android packages
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      - name: Download Godot 4.3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/godot"
+          cd "$RUNNER_TEMP/godot"
+
+          curl -fL --retry 3 \
+            -o godot.zip \
+            https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_linux.x86_64.zip
+
+          unzip -oq godot.zip
+          chmod +x Godot_v4.3-stable_linux.x86_64
+
+          echo "GODOT=$RUNNER_TEMP/godot/Godot_v4.3-stable_linux.x86_64" >> "$GITHUB_ENV"
+
+      - name: Install Godot export templates
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$HOME/.local/share/godot/export_templates/4.3.stable"
+          cd "$RUNNER_TEMP/godot"
+
+          curl -fL --retry 3 \
+            -o templates.tpz \
+            https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_export_templates.tpz
+
+          unzip -oq templates.tpz -d templates
+
+          TEMPLATE_DIR="$(find "$RUNNER_TEMP/godot/templates" -type d -name '4.3.stable' -print -quit)"
+
+          if [ -z "$TEMPLATE_DIR" ]; then
+            echo "::error::Godot export templates were not found."
+            exit 1
+          fi
+
+          cp -a "$TEMPLATE_DIR/." \
+            "$HOME/.local/share/godot/export_templates/4.3.stable/"
+
+      - name: Find Godot project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_FILE="$(find "$GITHUB_WORKSPACE" \
+            -type f -name project.godot \
+            -not -path '*/.git/*' \
+            -not -path '*/.godot/*' \
+            -print -quit)"
+
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "Searching ZIP archives for project.godot..."
+
+            python3 - <<'PY'
+          import os
+          import zipfile
+
+          root = os.environ["GITHUB_WORKSPACE"]
+          destination = os.path.join(root, "unpacked")
+          os.makedirs(destination, exist_ok=True)
+
+          for current, dirs, files in os.walk(root):
+              dirs[:] = [
+                  d for d in dirs
+                  if d not in {".git", ".godot", "unpacked"}
+              ]
+
+              for filename in files:
+                  if not filename.lower().endswith(".zip"):
+                      continue
+
+                  archive = os.path.join(current, filename)
+
+                  try:
+                      with zipfile.ZipFile(archive) as z:
+                          names = z.namelist()
+                          project = next(
+                              (n for n in names
+                               if n.endswith("project.godot")
+                               and n.count("/") < 5),
+                              None
+                          )
+
+                          if project:
+                              prefix = project.rsplit("/", 1)[0]
+                              for item in names:
+                                  if item.startswith(prefix + "/"):
+                                      z.extract(item, destination)
+                              print("Extracted project from:", archive)
+                              raise SystemExit(0)
+                  except zipfile.BadZipFile:
+                      continue
+
+          raise SystemExit(
+              "No project.godot found in the repository or ZIP archives."
+          )
+          PY
+
+            PROJECT_FILE="$(find "$GITHUB_WORKSPACE/unpacked" \
+              -type f -name project.godot -print -quit)"
+          fi
+
+          if [ -z "$PROJECT_FILE" ]; then
+            echo "::error::Could not find project.godot."
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PROJECT_FILE")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Godot project: $PROJECT_DIR"
 
       - name: Configure Android export preset
         shell: bash
         run: |
           set -euo pipefail
 
-          python3 - <<'PY'
-          from pathlib import Path
-          import re
-          import sys
+          mkdir -p "$PROJECT_DIR/build"
 
-          path = Path("unpacked/SteelHorizon/export_presets.cfg")
-          lines = path.read_text(encoding="utf-8").splitlines()
+          cat > "$PROJECT_DIR/export_presets.cfg" <<'PRESET'
+          [preset.0]
 
-          def section_end(start):
-              for i in range(start + 1, len(lines)):
-                  if re.match(r"^\s*\[.+\]\s*$", lines[i]):
-                      return i
-              return len(lines)
+          name="Android"
+          platform="Android"
+          runnable=true
+          dedicated_server=false
+          custom_features=""
+          export_filter="all_resources"
+          include_filter=""
+          exclude_filter=""
+          export_path="build/SteelHorizon-debug.apk"
+          encryption_include_filters=""
+          encryption_exclude_filters=""
+          encrypt_pck=false
+          encrypt_directory=false
 
-          # Найти Android-пресет.
-          preset_id = None
-          preset_start = None
+          [preset.0.options]
 
-          for i, line in enumerate(lines):
-              match = re.fullmatch(r"\[preset\.(\d+)\]", line.strip())
-              if not match:
-                  continue
+          custom_template/debug=""
+          custom_template/release=""
+          gradle_build/use_gradle_build=false
+          gradle_build/gradle_build_directory=""
+          gradle_build/android_source_template=""
+          gradle_build/compress_native_libraries=false
+          gradle_build/export_format=0
+          architectures/armeabi-v7a=false
+          architectures/arm64-v8a=true
+          architectures/x86=false
+          architectures/x86_64=false
+          version/code=1
+          version/name="1.0.0"
+          package/unique_name="org.godotengine.steelhorizon"
+          package/name="SteelHorizon"
+          package/signed=true
+          package/app_category=2
+          package/retain_data_on_uninstall=false
+          package/exclude_from_recents=false
+          package/show_in_android_tv=false
+          screen/immersive_mode=true
+          screen/support_small=true
+          permissions/internet=true
+          PRESET
 
-              end = section_end(i)
-              if any(x.strip() == 'name="Android"' for x in lines[i + 1:end]):
-                  preset_id = match.group(1)
-                  preset_start = i
-                  break
+          mkdir -p "$HOME/.config/godot"
 
-          if preset_id is None:
-              print("::error::Android preset not found in export_presets.cfg")
-              sys.exit(1)
+          cat > "$HOME/.config/godot/editor_settings-4.tres" <<EOF
+          [gd_resource type="EditorSettings" format=3]
 
-          # Задать путь для готового APK.
-          end = section_end(preset_start)
-          found = False
+          [resource]
+          export/android/android_sdk_path = "$ANDROID_HOME"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          EOF
 
-          for i in range(preset_start + 1, end):
-              if re.match(r"^\s*export_path\s*=", lines[i]):
-                  lines[i] = 'export_path="build/SteelHorizon-debug.apk"'
-                  found = True
-                  break
+      - name: Import Godot project
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          if not found:
-              lines.insert(
-                  preset_start + 1,
-                  'export_path="build/SteelHorizon-debug.apk"'
-              )
+          "$GODOT" --headless --editor \
+            --path "$PROJECT_DIR" \
+            --import
 
-          # Найти секцию параметров Android.
-          header = f"[preset.{preset_id}.options]"
-          options_start = next(
-              (i for i, line in enumerate(lines) if line.strip() == header),
-              None
-          )
+      - name: Export Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          if options_start is None:
-              print(f"::error::Missing section {header}")
-              sys.exit(1)
+          mkdir -p "$PROJECT_DIR/build"
 
-          # Исправить основные параметры Android-экспорта.
-          settings = {
-              "gradle_build/use_gradle_build": "true",
-              "package/unique_name": '"org.godotengine.steelhorizon"',
-              "version/code": "1",
-              "version/name": '"1.0.0"',
-              "architectures/armeabi-v7a": "false",
-              "architectures/arm64-v8a": "true",
-              "architectures/x86": "false",
-              "architectures/x86_64": "false",
-              "gradle_build/min_sdk": '"23"',
-              "gradle_build/target_sdk": '"34"',
-          }
+          "$GODOT" --headless \
+            --path "$PROJECT_DIR" \
+            --export-debug "Android" \
+            "$PROJECT_DIR/build/SteelHorizon-debug.apk"
 
-          for key, value in settings.items():
-              start = next(
-                  i for i, line in enumerate(lines)
-                  if line.strip() == header
-              )
-              end = section_end(start)
-              pattern = re.compile(
-                  r"^\s*" + re.escape(key) + r"\s*="
-              )
+          if [ ! -s "$PROJECT_DIR/build/SteelHorizon-debug.apk" ]; then
+            echo "::error::APK was not created."
+            exit 1
+          fi
 
-              existing = next(
-                  (
-                      i for i in range(start + 1, end)
-                      if pattern.match(lines[i])
-                  ),
-                  None
-              )
+          ls -lh "$PROJECT_DIR/build/SteelHorizon-debug.apk"
 
-              replacement = f"{key}={value}"
-
-              if existing is None:
-                  lines.insert(end, replacement)
-              else:
-                  lines[existing] = replacement
-
-          path.write_text(
-              "\n".join(lines) + "\n",
-              encoding="utf-8"
-          )
-
-          print("Android export preset configured:")
-          for key, value in settings.items():
-              print(f"{key} = {value}")
-          PY
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SteelHorizon-Android-APK
+          path: ${{ env.PROJECT_DIR }}/build/SteelHorizon-debug.apk
+          if-no-files-found: error
+          retention-days: 14
