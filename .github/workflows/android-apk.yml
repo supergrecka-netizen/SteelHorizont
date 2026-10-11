@@ -1,68 +1,4 @@
 
-name: Build SteelHorizon Android APK
-
-on:
-  push:
-    branches:
-      - main
-    paths:
-      - "SteelHorizon-Godot-Prototype.zip"
-      - ".github/workflows/android-apk.yml"
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-concurrency:
-  group: steelhorizon-android-build
-  cancel-in-progress: true
-
-jobs:
-  build-android:
-    name: Build Android APK
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-
-    steps:
-      # 1. Скачать репозиторий
-      - name: Checkout repository
-        uses: actions/checkout@v5
-
-      # 2. Проверить и распаковать проект
-      - name: Extract and check project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ARCHIVE="SteelHorizon-Godot-Prototype.zip"
-
-          if [[ ! -f "$ARCHIVE" ]]; then
-            echo "::error::Не найден архив проекта: $ARCHIVE"
-            exit 1
-          fi
-
-          unzip -t "$ARCHIVE" >/dev/null
-
-          mkdir -p unpacked
-          unzip -q "$ARCHIVE" -d unpacked
-
-          PROJECT_DIR="unpacked/SteelHorizon"
-
-          if [[ ! -f "$PROJECT_DIR/project.godot" ]]; then
-            echo "::error::Не найден unpacked/SteelHorizon/project.godot"
-            find unpacked -maxdepth 4 -type f | head -200
-            exit 1
-          fi
-
-          if [[ ! -f "$PROJECT_DIR/export_presets.cfg" ]]; then
-            echo "::error::Не найден export_presets.cfg"
-            exit 1
-          fi
-
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Проект найден и распакован."
-
-      # 3. Настроить Android-пресет
       - name: Configure Android export preset
         shell: bash
         run: |
@@ -82,6 +18,7 @@ jobs:
                       return i
               return len(lines)
 
+          # Найти Android-пресет.
           preset_id = None
           preset_start = None
 
@@ -97,285 +34,81 @@ jobs:
                   break
 
           if preset_id is None:
-              print("::error::В export_presets.cfg не найден пресет Android")
+              print("::error::Android preset not found in export_presets.cfg")
               sys.exit(1)
 
-          # Обновить путь экспорта APK.
+          # Задать путь для готового APK.
           end = section_end(preset_start)
-          export_line = 'export_path="build/SteelHorizon-debug.apk"'
           found = False
 
           for i in range(preset_start + 1, end):
               if re.match(r"^\s*export_path\s*=", lines[i]):
-                  lines[i] = export_line
+                  lines[i] = 'export_path="build/SteelHorizon-debug.apk"'
                   found = True
                   break
 
           if not found:
-              lines.insert(preset_start + 1, export_line)
+              lines.insert(
+                  preset_start + 1,
+                  'export_path="build/SteelHorizon-debug.apk"'
+              )
 
-          # После вставки заново найти секцию параметров.
-          options_header = f"[preset.{preset_id}.options]"
+          # Найти секцию параметров Android.
+          header = f"[preset.{preset_id}.options]"
           options_start = next(
-              (i for i, x in enumerate(lines) if x.strip() == options_header),
+              (i for i, line in enumerate(lines) if line.strip() == header),
               None
           )
 
           if options_start is None:
-              print(f"::error::Не найдена секция {options_header}")
+              print(f"::error::Missing section {header}")
               sys.exit(1)
 
-          options_end = section_end(options_start)
-          key = "gradle_build/use_gradle_build"
-          found = False
+          # Исправить основные параметры Android-экспорта.
+          settings = {
+              "gradle_build/use_gradle_build": "true",
+              "package/unique_name": '"org.godotengine.steelhorizon"',
+              "version/code": "1",
+              "version/name": '"1.0.0"',
+              "architectures/armeabi-v7a": "false",
+              "architectures/arm64-v8a": "true",
+              "architectures/x86": "false",
+              "architectures/x86_64": "false",
+              "gradle_build/min_sdk": '"23"',
+              "gradle_build/target_sdk": '"34"',
+          }
 
-          for i in range(options_start + 1, options_end):
-              if re.match(rf"^\s*{re.escape(key)}\s*=", lines[i]):
-                  lines[i] = f"{key}=true"
-                  found = True
-                  break
+          for key, value in settings.items():
+              start = next(
+                  i for i, line in enumerate(lines)
+                  if line.strip() == header
+              )
+              end = section_end(start)
+              pattern = re.compile(
+                  r"^\s*" + re.escape(key) + r"\s*="
+              )
 
-          if not found:
-              lines.insert(options_start + 1, f"{key}=true")
+              existing = next(
+                  (
+                      i for i in range(start + 1, end)
+                      if pattern.match(lines[i])
+                  ),
+                  None
+              )
 
-          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+              replacement = f"{key}={value}"
 
-          print(f"Android preset ID: {preset_id}")
-          print("Gradle Build включён.")
-          print("Путь APK: build/SteelHorizon-debug.apk")
+              if existing is None:
+                  lines.insert(end, replacement)
+              else:
+                  lines[existing] = replacement
+
+          path.write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8"
+          )
+
+          print("Android export preset configured:")
+          for key, value in settings.items():
+              print(f"{key} = {value}")
           PY
-
-      # 4. Установить Java JDK 17
-      - name: Set up Java 17
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      # 5. Настроить Android SDK
-      - name: Set up Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-
-          if [[ ! -d "$SDK_ROOT" ]]; then
-            echo "::error::Android SDK не найден: $SDK_ROOT"
-            exit 1
-          fi
-
-          SDKMANAGER="$(
-            find "$SDK_ROOT/cmdline-tools" \
-              -type f -name sdkmanager 2>/dev/null \
-              | sort -V | tail -n 1
-          )"
-
-          if [[ -z "$SDKMANAGER" ]]; then
-            echo "::error::Не найден sdkmanager"
-            exit 1
-          fi
-
-          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-
-          echo "Java:"
-          java -version
-
-          # Принять лицензии Android SDK.
-          set +e
-          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1
-          set -e
-
-          "$SDKMANAGER" \
-            "platform-tools" \
-            "platforms;android-34" \
-            "build-tools;34.0.0"
-
-          echo "ANDROID SDK готов."
-
-      # 6. Скачать и установить экспортные шаблоны Godot 4.3
-      - name: Install Godot 4.3 export templates
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          GODOT_VERSION="4.3-stable"
-          BASE_URL="https://github.com/godotengine/godot/releases/download/$GODOT_VERSION"
-
-          GODOT_ZIP="$RUNNER_TEMP/godot.zip"
-          TEMPLATES="$RUNNER_TEMP/godot-templates.tpz"
-          GODOT_DIR="$RUNNER_TEMP/godot"
-          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/4.3.stable"
-
-          mkdir -p "$GODOT_DIR" "$TEMPLATE_DIR"
-
-          echo "Скачиваем Godot..."
-          curl -fL --retry 3 \
-            "$BASE_URL/Godot_v4.3-stable_linux.x86_64.zip" \
-            -o "$GODOT_ZIP"
-
-          unzip -q -o "$GODOT_ZIP" -d "$GODOT_DIR"
-
-          GODOT_BIN="$(
-            find "$GODOT_DIR" -type f \
-              -name 'Godot_v4.3-stable_linux.x86_64' \
-              -print -quit
-          )"
-
-          if [[ -z "$GODOT_BIN" ]]; then
-            echo "::error::Исполняемый файл Godot не найден"
-            exit 1
-          fi
-
-          chmod +x "$GODOT_BIN"
-          echo "GODOT_BIN=$GODOT_BIN" >> "$GITHUB_ENV"
-
-          echo "Версия Godot:"
-          "$GODOT_BIN" --version
-
-          echo "Скачиваем шаблоны..."
-          curl -fL --retry 3 \
-            "$BASE_URL/Godot_v4.3-stable_export_templates.tpz" \
-            -o "$TEMPLATES"
-
-          unzip -o -j "$TEMPLATES" -d "$TEMPLATE_DIR"
-
-          if [[ ! -f "$TEMPLATE_DIR/version.txt" ]]; then
-            echo "::error::Не установлен version.txt экспортных шаблонов"
-            ls -la "$TEMPLATE_DIR"
-            exit 1
-          fi
-
-          echo "Экспортные шаблоны установлены."
-          cat "$TEMPLATE_DIR/version.txt"
-
-      # 7. Установить Android Gradle-шаблон проекта
-      - name: Install Android Gradle template
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          PROJECT_DIR="unpacked/SteelHorizon"
-          TEMPLATE_DIR="$HOME/.local/share/godot/export_templates/4.3.stable"
-          SOURCE_ZIP="$TEMPLATE_DIR/android_source.zip"
-
-          if [[ ! -s "$SOURCE_ZIP" ]]; then
-            echo "::error::В экспортных шаблонах отсутствует android_source.zip"
-            exit 1
-          fi
-
-          rm -rf "$PROJECT_DIR/android/build"
-          mkdir -p "$PROJECT_DIR/android/build"
-
-          unzip -q -o "$SOURCE_ZIP" -d "$PROJECT_DIR/android/build"
-
-          if [[ ! -f "$PROJECT_DIR/android/build/build.gradle" ]]; then
-            echo "::error::В android/build не найден build.gradle"
-            find "$PROJECT_DIR/android/build" -maxdepth 3 -type f | head -100
-            exit 1
-          fi
-
-          chmod +x "$PROJECT_DIR/android/build/gradlew"
-
-          echo "Android Gradle-шаблон установлен."
-
-      # 8. Явно задать пути к Java и Android SDK для Godot
-      - name: Configure Godot Android paths
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          SDK_ROOT="$ANDROID_HOME"
-          JDK_ROOT="$JAVA_HOME"
-          SETTINGS_DIR="$HOME/.config/godot"
-          SETTINGS_FILE="$SETTINGS_DIR/editor_settings-4.tres"
-
-          if [[ ! -x "$JDK_ROOT/bin/java" ]]; then
-            echo "::error::Java не найден в $JDK_ROOT"
-            exit 1
-          fi
-
-          if [[ ! -d "$SDK_ROOT/platform-tools" ]]; then
-            echo "::error::Android SDK не настроен: $SDK_ROOT"
-            exit 1
-          fi
-
-          mkdir -p "$SETTINGS_DIR"
-
-          cat > "$SETTINGS_FILE" <<EOF
-          [gd_resource type="EditorSettings" format=3]
-
-          [resource]
-          export/android/android_sdk_path = "$SDK_ROOT"
-          export/android/java_sdk_path = "$JDK_ROOT"
-          EOF
-
-          echo "Настройки Godot:"
-          cat "$SETTINGS_FILE"
-
-          echo "Java SDK: $JDK_ROOT"
-          echo "Android SDK: $SDK_ROOT"
-
-      # 9. Импортировать проект и проверить его
-      - name: Import Godot project
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          "$GODOT_BIN" \
-            --headless \
-            --editor \
-            --path "$PROJECT_DIR" \
-            --import
-
-          echo "Импорт проекта завершён."
-
-      # 10. Экспортировать APK напрямую через Godot
-      - name: Export Android APK
-        shell: bash
-        run: |
-          set -uo pipefail
-
-          mkdir -p "$PROJECT_DIR/build"
-          APK="$PROJECT_DIR/build/SteelHorizon-debug.apk"
-          LOG="$RUNNER_TEMP/godot-export.log"
-
-          echo "Начинаем экспорт Android APK..."
-          echo "Если экспорт завершится ошибкой, вывод Godot будет показан ниже."
-
-          "$GODOT_BIN" \
-            --headless \
-            --path "$PROJECT_DIR" \
-            --export-debug "Android" "$APK" \
-            --verbose 2>&1 | tee "$LOG"
-
-          GODOT_STATUS=${PIPESTATUS[0]}
-
-          if [[ "$GODOT_STATUS" -ne 0 ]]; then
-            echo "::error::Godot завершился с кодом $GODOT_STATUS"
-            echo "Последние сообщения Godot:"
-            tail -n 200 "$LOG"
-            exit "$GODOT_STATUS"
-          fi
-
-          if [[ ! -s "$APK" ]]; then
-            echo "::error::Godot завершился, но APK не найден или пуст"
-            find "$PROJECT_DIR" -type f -name "*.apk" -print || true
-            tail -n 200 "$LOG"
-            exit 1
-          fi
-
-          echo "APK успешно создан:"
-          ls -lh "$APK"
-
-      # 11. Загрузить APK для скачивания
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: SteelHorizon-Android-APK
-          path: unpacked/SteelHorizon/build/SteelHorizon-debug.apk
-          if-no-files-found: error
-          retention-days: 14
