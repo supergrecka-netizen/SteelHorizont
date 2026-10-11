@@ -31,15 +31,12 @@ jobs:
       - name: Install Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Verify tool versions
+      - name: Verify tools
         shell: bash
         run: |
           set -euo pipefail
-          echo "Java:"
           java -version
-          echo "Node.js:"
           node --version
-          echo "Android SDK:"
           sdkmanager --version
 
       - name: Install Android packages
@@ -55,6 +52,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p "$RUNNER_TEMP/godot"
           cd "$RUNNER_TEMP/godot"
 
@@ -66,10 +64,11 @@ jobs:
 
           echo "GODOT=$RUNNER_TEMP/godot/Godot_v4.3-stable_linux.x86_64" >> "$GITHUB_ENV"
 
-      - name: Download and install Godot export templates
+      - name: Install Godot export templates
         shell: bash
         run: |
           set -euo pipefail
+
           cd "$RUNNER_TEMP/godot"
 
           curl -fL --retry 3 -o templates.tpz \
@@ -79,11 +78,11 @@ jobs:
           unzip -oq templates.tpz -d "$RUNNER_TEMP/godot/template_archive"
 
           TEMPLATE_FILE="$(find "$RUNNER_TEMP/godot/template_archive" \
-            -type f -name 'android_debug.apk' -print -quit)"
+            -type f -name android_debug.apk -print -quit)"
 
           if [ -z "$TEMPLATE_FILE" ]; then
-            echo "::error::Android export templates were not found in the archive."
-            find "$RUNNER_TEMP/godot/template_archive" -maxdepth 4 -type f
+            echo "::error::android_debug.apk was not found in the template archive."
+            find "$RUNNER_TEMP/godot/template_archive" -maxdepth 5 -type f
             exit 1
           fi
 
@@ -94,8 +93,12 @@ jobs:
           cp -a "$TEMPLATE_SOURCE/." "$TEMPLATE_DEST/"
 
           test -s "$TEMPLATE_DEST/android_debug.apk"
+          test -s "$TEMPLATE_DEST/android_release.apk"
 
-      - name: Find Godot project
+          echo "Installed templates:"
+          ls -lah "$TEMPLATE_DEST"
+
+      - name: Find and extract Godot project
         shell: bash
         run: |
           set -euo pipefail
@@ -134,27 +137,32 @@ jobs:
                           names = z.namelist()
                           project = next(
                               (
-                                  n for n in names
-                                  if n == "project.godot"
-                                  or n.endswith("/project.godot")
+                                  name for name in names
+                                  if name == "project.godot"
+                                  or name.endswith("/project.godot")
                               ),
                               None
                           )
 
-                          if project:
-                              prefix = project.rsplit("/", 1)[0]
-                              for item in names:
-                                  if prefix:
-                                      if item.startswith(prefix + "/"):
-                                          z.extract(item, destination)
-                                  else:
+                          if not project:
+                              continue
+
+                          prefix = project.rsplit("/", 1)[0]
+                          for item in names:
+                              if prefix:
+                                  if item.startswith(prefix + "/"):
                                       z.extract(item, destination)
-                              raise SystemExit(0)
+                              else:
+                                  z.extract(item, destination)
+
+                          raise SystemExit(0)
 
                   except zipfile.BadZipFile:
-                      pass
+                      continue
 
-          raise SystemExit("No project.godot found in repository or ZIP archives.")
+          raise SystemExit(
+              "Could not find project.godot in the repository or ZIP files."
+          )
           PY
 
             PROJECT_FILE="$(find "$GITHUB_WORKSPACE/unpacked" \
@@ -162,18 +170,21 @@ jobs:
           fi
 
           if [ -z "$PROJECT_FILE" ]; then
-            echo "::error::Could not find project.godot."
+            echo "::error::Could not locate project.godot."
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$PROJECT_FILE")"
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Godot project: $PROJECT_DIR"
+
+          echo "Project directory: $PROJECT_DIR"
+          ls -lah "$PROJECT_DIR"
 
       - name: Configure Android export preset
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p "$PROJECT_DIR/build"
 
           cat > "$PROJECT_DIR/export_presets.cfg" <<'PRESET'
@@ -211,6 +222,7 @@ jobs:
           PRESET
 
           mkdir -p "$HOME/.config/godot"
+
           cat > "$HOME/.config/godot/editor_settings-4.tres" <<EOF
           [gd_resource type="EditorSettings" format=3]
 
@@ -219,30 +231,125 @@ jobs:
           export/android/java_sdk_path = "$JAVA_HOME"
           EOF
 
+      - name: Enable Android texture import
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - "$PROJECT_DIR/project.godot" <<'PY'
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          content = path.read_text(encoding="utf-8")
+          setting = "textures/vram_compression/import_etc2_astc=true"
+
+          if setting not in content:
+              if "[rendering]" in content:
+                  content = content.replace(
+                      "[rendering]",
+                      "[rendering]\n" + setting,
+                      1
+                  )
+              else:
+                  content += "\n[rendering]\n" + setting + "\n"
+
+              path.write_text(content, encoding="utf-8")
+
+          print("Android ETC2/ASTC texture import setting applied.")
+          PY
+
+          grep -n -A 8 '^\[rendering\]' "$PROJECT_DIR/project.godot" || true
+
       - name: Import Godot project
         shell: bash
         run: |
           set -euo pipefail
-          "$GODOT" --headless --editor --path "$PROJECT_DIR" --import
 
-      - name: Export Android APK
+          "$GODOT" \
+            --headless \
+            --editor \
+            --path "$PROJECT_DIR" \
+            --import \
+            --verbose 2>&1 | tee "$RUNNER_TEMP/godot-import.log"
+
+      - name: Diagnose Godot Android export configuration
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "Godot version:"
+          "$GODOT" --version
+
+          echo "Android SDK: $ANDROID_HOME"
+          echo "Java SDK: $JAVA_HOME"
+
+          echo "Checking required paths..."
+          test -d "$ANDROID_HOME"
+          test -d "$JAVA_HOME"
+          test -s "$HOME/.local/share/godot/export_templates/4.3.stable/android_debug.apk"
+
+          echo "Checking project configuration..."
+          "$GODOT" \
+            --headless \
+            --editor \
+            --path "$PROJECT_DIR" \
+            --quit \
+            --verbose 2>&1 | tee "$RUNNER_TEMP/godot-diagnostics.log"
+
+      - name: Export Android APK with detailed logs
+        shell: bash
+        run: |
+          set -uo pipefail
+
           mkdir -p "$PROJECT_DIR/build"
 
+          set +e
           "$GODOT" \
             --headless \
             --path "$PROJECT_DIR" \
             --export-debug "Android" \
-            "$PROJECT_DIR/build/SteelHorizon-debug.apk"
+            "$PROJECT_DIR/build/SteelHorizon-debug.apk" \
+            --verbose 2>&1 | tee "$RUNNER_TEMP/godot-export.log"
 
-          test -s "$PROJECT_DIR/build/SteelHorizon-debug.apk"
+          EXPORT_STATUS=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$EXPORT_STATUS" -ne 0 ]; then
+            echo "::error::Godot Android export failed. Relevant diagnostics follow."
+            grep -inE \
+              'error|warning|android|export|template|sdk|keystore|sign|invalid|failed' \
+              "$RUNNER_TEMP/godot-export.log" | tail -n 100 || true
+
+            echo "Full export log is available in the job output."
+            exit "$EXPORT_STATUS"
+          fi
+
+          if [ ! -s "$PROJECT_DIR/build/SteelHorizon-debug.apk" ]; then
+            echo "::error::Godot returned success but the APK file is missing."
+            exit 1
+          fi
+
+          echo "APK created:"
+          ls -lh "$PROJECT_DIR/build/SteelHorizon-debug.apk"
 
       - name: Upload APK
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: SteelHorizon-Android-APK
           path: ${{ env.PROJECT_DIR }}/build/SteelHorizon-debug.apk
           if-no-files-found: error
           retention-days: 14
+
+      - name: Upload diagnostic logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SteelHorizon-build-diagnostics
+          path: |
+            ${{ runner.temp }}/godot-export.log
+            ${{ runner.temp }}/godot-import.log
+            ${{ runner.temp }}/godot-diagnostics.log
+          if-no-files-found: ignore
+          retention-days: 7
