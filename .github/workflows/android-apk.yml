@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "**"
+      - ".github/workflows/android-apk.yml"
 
 permissions:
   contents: read
@@ -12,21 +15,21 @@ permissions:
 jobs:
   build-android:
     name: Build Android APK
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
       - name: Install Java 17
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
       - name: Install Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@v3
 
       - name: Install Android packages
         run: |
@@ -40,10 +43,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p "$RUNNER_TEMP/godot"
           cd "$RUNNER_TEMP/godot"
 
-          curl -fL --retry 3 -o godot.zip \
+          curl -fL --retry 3 \
+            -o godot.zip \
             https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_linux.x86_64.zip
 
           unzip -oq godot.zip
@@ -55,23 +60,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          mkdir -p "$HOME/.local/share/godot/export_templates/4.3.stable"
           cd "$RUNNER_TEMP/godot"
 
-          curl -fL --retry 3 -o templates.tpz \
+          curl -fL --retry 3 \
+            -o templates.tpz \
             https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_export_templates.tpz
 
-          mkdir -p "$RUNNER_TEMP/godot/templates"
-          unzip -oq templates.tpz -d "$RUNNER_TEMP/godot/templates"
+          unzip -oq templates.tpz -d templates
 
           TEMPLATE_DIR="$(find "$RUNNER_TEMP/godot/templates" -type d -name '4.3.stable' -print -quit)"
 
           if [ -z "$TEMPLATE_DIR" ]; then
-            echo "::error::Godot export templates not found."
+            echo "::error::Godot export templates were not found."
             exit 1
           fi
 
-          mkdir -p "$HOME/.local/share/godot/export_templates/4.3.stable"
-          cp -a "$TEMPLATE_DIR/." "$HOME/.local/share/godot/export_templates/4.3.stable/"
+          cp -a "$TEMPLATE_DIR/." \
+            "$HOME/.local/share/godot/export_templates/4.3.stable/"
 
       - name: Find Godot project
         shell: bash
@@ -85,7 +92,7 @@ jobs:
             -print -quit)"
 
           if [ -z "$PROJECT_FILE" ]; then
-            mkdir -p "$GITHUB_WORKSPACE/unpacked"
+            echo "Searching ZIP archives for project.godot..."
 
             python3 - <<'PY'
           import os
@@ -93,30 +100,47 @@ jobs:
 
           root = os.environ["GITHUB_WORKSPACE"]
           destination = os.path.join(root, "unpacked")
+          os.makedirs(destination, exist_ok=True)
 
           for current, dirs, files in os.walk(root):
-              dirs[:] = [d for d in dirs if d not in {".git", ".godot", "unpacked"}]
+              dirs[:] = [
+                  d for d in dirs
+                  if d not in {".git", ".godot", "unpacked"}
+              ]
+
               for filename in files:
                   if not filename.lower().endswith(".zip"):
                       continue
+
                   archive = os.path.join(current, filename)
+
                   try:
                       with zipfile.ZipFile(archive) as z:
                           names = z.namelist()
-                          project = next((n for n in names if n.endswith("project.godot")), None)
+                          project = next(
+                              (n for n in names
+                               if n.endswith("project.godot")
+                               and n.count("/") < 5),
+                              None
+                          )
+
                           if project:
                               prefix = project.rsplit("/", 1)[0]
                               for item in names:
                                   if item.startswith(prefix + "/"):
                                       z.extract(item, destination)
+                              print("Extracted project from:", archive)
                               raise SystemExit(0)
                   except zipfile.BadZipFile:
-                      pass
+                      continue
 
-          raise SystemExit("No project.godot found in repository or ZIP archives.")
+          raise SystemExit(
+              "No project.godot found in the repository or ZIP archives."
+          )
           PY
 
-            PROJECT_FILE="$(find "$GITHUB_WORKSPACE/unpacked" -type f -name project.godot -print -quit)"
+            PROJECT_FILE="$(find "$GITHUB_WORKSPACE/unpacked" \
+              -type f -name project.godot -print -quit)"
           fi
 
           if [ -z "$PROJECT_FILE" ]; then
@@ -137,6 +161,7 @@ jobs:
 
           cat > "$PROJECT_DIR/export_presets.cfg" <<'PRESET'
           [preset.0]
+
           name="Android"
           platform="Android"
           runnable=true
@@ -152,9 +177,14 @@ jobs:
           encrypt_directory=false
 
           [preset.0.options]
+
           custom_template/debug=""
           custom_template/release=""
           gradle_build/use_gradle_build=false
+          gradle_build/gradle_build_directory=""
+          gradle_build/android_source_template=""
+          gradle_build/compress_native_libraries=false
+          gradle_build/export_format=0
           architectures/armeabi-v7a=false
           architectures/arm64-v8a=true
           architectures/x86=false
@@ -163,13 +193,18 @@ jobs:
           version/name="1.0.0"
           package/unique_name="org.godotengine.steelhorizon"
           package/name="SteelHorizon"
-          package/signed=false
+          package/signed=true
+          package/app_category=2
+          package/retain_data_on_uninstall=false
+          package/exclude_from_recents=false
+          package/show_in_android_tv=false
           screen/immersive_mode=true
           screen/support_small=true
           permissions/internet=true
           PRESET
 
           mkdir -p "$HOME/.config/godot"
+
           cat > "$HOME/.config/godot/editor_settings-4.tres" <<EOF
           [gd_resource type="EditorSettings" format=3]
 
@@ -179,13 +214,19 @@ jobs:
           EOF
 
       - name: Import Godot project
+        shell: bash
         run: |
           set -euo pipefail
-          "$GODOT" --headless --editor --path "$PROJECT_DIR" --import
+
+          "$GODOT" --headless --editor \
+            --path "$PROJECT_DIR" \
+            --import
 
       - name: Export Android APK
+        shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p "$PROJECT_DIR/build"
 
           "$GODOT" --headless \
@@ -193,7 +234,12 @@ jobs:
             --export-debug "Android" \
             "$PROJECT_DIR/build/SteelHorizon-debug.apk"
 
-          test -s "$PROJECT_DIR/build/SteelHorizon-debug.apk"
+          if [ ! -s "$PROJECT_DIR/build/SteelHorizon-debug.apk" ]; then
+            echo "::error::APK was not created."
+            exit 1
+          fi
+
+          ls -lh "$PROJECT_DIR/build/SteelHorizon-debug.apk"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
